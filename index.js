@@ -6,110 +6,98 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ===== CONFIG =====
-const CARTOLA_API = 'https://api.cartola.globo.com'; // <- ajuste principal
-const GLB_TOKEN = process.env.GLB_TOKEN || ''; // opcional se usar rotas autenticadas
+// ====== CONFIG ======
+const CARTOLA_API = 'https://api.cartola.globo.com'; // <- domínio correto
+const GLB_TOKEN = process.env.GLB_TOKEN || '';       // opcional, para endpoints autenticados
 
-const http = axios.create({
-  baseURL: CARTOLA_API,
-  timeout: 15000,
-  headers: {
-    'User-Agent': 'Mozilla/5.0',
-    'Accept': 'application/json',
-    ...(GLB_TOKEN ? { 'X-GLB-Token': GLB_TOKEN } : {})
-  }
-});
+// Headers padrão
+const headers = {
+  'User-Agent': 'Mozilla/5.0',
+  'Accept': 'application/json',
+  ...(GLB_TOKEN ? { 'X-GLB-Token': GLB_TOKEN } : {})
+};
 
-// Cache simples p/ escalação
-const lineupCache = new Map(); // key: timeId, value: { ts, atletas }
-const CACHE_MS = 5 * 60 * 1000;
+// Cache simples do elenco dos times (minimiza chamadas ao /time/id/:id)
+const lineupCache = new Map(); // key: timeId, value: { ts, atletas: [ids] }
+const CACHE_MS = 5 * 60 * 1000; // 5 minutos
 
-// ===== Helpers =====
+// ====== Helpers ======
 async function getLeague(leagueIdOrSlug) {
-  const { data } = await http.get(`/ligas/${leagueIdOrSlug}`);
-  return data;
-}
-
-async function getMercadoStatus() {
-  const { data } = await http.get('/mercado/status');
-  return data; // { rodada_atual, status_mercado, ... }
+  const url = `${CARTOLA_API}/ligas/${leagueIdOrSlug}`;
+  const { data } = await axios.get(url, { headers });
+  return data; // inclui infos da liga + times/participantes (estrutura varia)
 }
 
 async function getPontuados() {
-  const { data } = await http.get('/atletas/pontuados');
-  return data.atletas || {}; // { "1234": { atleta_id, pontuacao, ... }, ... }
+  const url = `${CARTOLA_API}/atletas/pontuados`;
+  const { data } = await axios.get(url, { headers });
+  // formato: { atletas: { "123": { atleta_id, pontuacao, ... }, ... } }
+  return data.atletas || {};
 }
 
 async function getTimeLineup(timeId) {
   const now = Date.now();
   const cached = lineupCache.get(timeId);
-  if (cached && (now - cached.ts) < CACHE_MS) return cached.atletas;
+  if (cached && (now - cached.ts) < CACHE_MS) {
+    return cached.atletas;
+  }
 
-  const { data } = await http.get(`/time/id/${timeId}`);
-  const atletas = Array.isArray(data?.atletas)
-    ? data.atletas.map(a => a.atleta_id).filter(Boolean)
-    : [];
+  const url = `${CARTOLA_API}/time/id/${timeId}`;
+  const { data } = await axios.get(url, { headers });
+  // normalmente: data.atletas = [{ atleta_id, ... }]
+  const atletas = (data.atletas || []).map(a => a.atleta_id);
   lineupCache.set(timeId, { ts: now, atletas });
   return atletas;
 }
 
-// Tenta extrair participantes de diferentes formatos
+// Alguns formatos de resposta de liga diferem — tente várias chaves comuns
 function extrairParticipantesLiga(liga) {
-  // formatos comuns:
-  // - liga.times (array)
-  // - liga.times_participantes (array)
-  // - liga.liga?.times (obj ou array)
-  // Vamos ser flexíveis:
-  if (Array.isArray(liga?.times)) return liga.times;
-  if (Array.isArray(liga?.times_participantes)) return liga.times_participantes;
-
-  // às vezes vem algo como { liga: { times: [...] } }
-  if (Array.isArray(liga?.liga?.times)) return liga.liga.times;
-
-  // fallback: nada
-  return [];
+  return (
+    liga?.times ||
+    liga?.times_participantes ||
+    liga?.participantes ||
+    liga?.liga?.times ||
+    []
+  );
 }
 
-// ===== Rotas utilitárias =====
-app.get('/health', (req, res) => res.type('text').send('ok'));
+// ====== Rotas ======
+app.get('/', (req, res) => {
+  res.send('Cartola Proxy OK. Use /health, /status ou /live/:leagueId');
+});
+
+app.get('/health', (req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString() });
+});
 
 app.get('/status', async (req, res) => {
   try {
-    const st = await getMercadoStatus();
-    res.json(st);
+    const { data } = await axios.get(`${CARTOLA_API}/mercado/status`, { headers });
+    res.json(data);
   } catch (e) {
     console.error('STATUS FAIL:', e?.response?.status, e?.response?.data || e.message);
-    res.status(500).json({ error: 'Falha ao obter status do mercado.' });
+    res.status(500).json({ error: 'Falha ao obter status.' });
   }
 });
 
-// ===== Live da liga =====
 app.get('/live/:leagueId', async (req, res) => {
-  const leagueId = req.params.leagueId;
   try {
-    const [liga, statusMercado] = await Promise.all([
-      getLeague(leagueId),
-      getMercadoStatus(),
-    ]);
-
-    // Se o mercado estiver ABERTO, /atletas/pontuados costuma não retornar parciais
-    // Ainda assim tentamos, mas avisamos no metadata
-    const pontuados = await getPontuados();
+    const leagueId = req.params.leagueId; // slug ou id da liga
+    const liga = await getLeague(leagueId);
+    const pontuados = await getPontuados(); // só responde quando mercado fechado
 
     const participantes = extrairParticipantesLiga(liga);
     if (!Array.isArray(participantes) || participantes.length === 0) {
-      console.warn('Liga sem participantes reconhecidos. Payload liga:', Object.keys(liga || {}));
       return res.json({
+        aviso: 'Liga sem participantes reconhecidos neste formato.',
         liga: liga?.liga || { id: leagueId },
-        mercado_status: statusMercado,
-        atualizacao: new Date().toISOString(),
-        resultados: [],
-        aviso: 'Não consegui identificar participantes desta liga.'
+        resultados: []
       });
     }
 
     const resultados = [];
     for (const t of participantes) {
+      // tente vários formatos
       const timeId = t?.time_id || t?.time?.time_id;
       const nomeTime = t?.nome || t?.time?.nome || t?.nome_time || 'Time';
       if (!timeId) continue;
@@ -128,11 +116,11 @@ app.get('/live/:leagueId', async (req, res) => {
       });
     }
 
+    // ordena do maior para o menor
     resultados.sort((a, b) => b.parcial - a.parcial);
 
     res.json({
       liga: liga?.liga || { id: leagueId },
-      mercado_status: statusMercado,
       atualizacao: new Date().toISOString(),
       resultados
     });
@@ -142,5 +130,8 @@ app.get('/live/:leagueId', async (req, res) => {
   }
 });
 
+// ====== Start ======
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Proxy Cartola rodando na porta ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Proxy Cartola rodando na porta ${PORT}`);
+});
