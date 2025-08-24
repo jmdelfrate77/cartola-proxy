@@ -1,3 +1,4 @@
+// index.js
 import express from 'express';
 import cors from 'cors';
 import axios from 'axios';
@@ -6,9 +7,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ===== CONFIG =====
-const CARTOLA_API = 'https://api.cartola.globo.com'; // <- base corrigida
-const GLB_TOKEN = process.env.GLB_TOKEN || ''; // opcional (p/ rotas que exigirem login)
+// ================== CONFIG ==================
+const CARTOLA_API = 'https://api.cartolafc.globo.com';
+// Se precisar de endpoints privados/ligas privadas, coloque seu token no Railway (Variables)
+const GLB_TOKEN = process.env.GLB_TOKEN || ''; // opcional
 
 const headers = {
   'User-Agent': 'Mozilla/5.0',
@@ -16,27 +18,43 @@ const headers = {
   ...(GLB_TOKEN ? { 'X-GLB-Token': GLB_TOKEN } : {}),
 };
 
-// Cache simples p/ escalações
-const lineupCache = new Map(); // key: timeId, value: { ts, atletas }
-const CACHE_MS = 5 * 60 * 1000; // 5min
+// Cache simples em memória (alinha/lineup por time)
+const lineupCache = new Map(); // key: timeId, value: { ts, atletas: [ids] }
+const CACHE_MS = 5 * 60 * 1000; // 5 minutos
 
-// ===== Helpers =====
+// ================== HELPERS ==================
 async function getStatus() {
-  const url = `${CARTOLA_API}/status`;
+  const url = `${CARTOLA_API}/mercado/status`;
   const { data } = await axios.get(url, { headers });
   return data;
-}
-
-async function getLeague(idOrSlug) {
-  const url = `${CARTOLA_API}/ligas/${idOrSlug}`;
-  const { data } = await axios.get(url, { headers });
-  return data; // contém info da liga + lista de participantes (formato varia)
 }
 
 async function getPontuados() {
   const url = `${CARTOLA_API}/atletas/pontuados`;
   const { data } = await axios.get(url, { headers });
-  return data.atletas || {}; // {"1234": {atleta_id, pontuacao, ...}, ...}
+  // data.atletas = { "123": { atleta_id: 123, pontuacao: 5.2, ... }, ... }
+  return data.atletas || {};
+}
+
+// tenta plural e singular + URL-Encode do slug
+async function getLeague(idOrSlug) {
+  const slug = encodeURIComponent(idOrSlug);
+  const urls = [
+    `${CARTOLA_API}/ligas/${slug}`, // plural
+    `${CARTOLA_API}/liga/${slug}`,  // singular (fallback)
+  ];
+
+  let lastErr;
+  for (const url of urls) {
+    try {
+      const { data } = await axios.get(url, { headers });
+      return data;
+    } catch (e) {
+      lastErr = e;
+      // tenta próxima variação
+    }
+  }
+  throw lastErr;
 }
 
 async function getTimeLineup(timeId) {
@@ -47,111 +65,150 @@ async function getTimeLineup(timeId) {
   const url = `${CARTOLA_API}/time/id/${timeId}`;
   const { data } = await axios.get(url, { headers });
 
-  // Alguns anos a API retorna { atletas: [...] }, em outros outra chave
-  const atletas = Array.isArray(data?.atletas)
-    ? data.atletas.map(a => a.atleta_id)
-    : [];
+  // Estruturas possíveis por temporada:
+  // - data.atletas = [{ atleta_id }, ...]
+  // - data.time?.atletas = [{ atleta_id }, ...]
+  // - data?.time?.jogadores etc (ajuste se necessário)
+  const arr =
+    data?.atletas ||
+    data?.time?.atletas ||
+    [];
 
+  const atletas = arr.map(a => a.atleta_id).filter(Boolean);
   lineupCache.set(timeId, { ts: now, atletas });
   return atletas;
 }
 
-/**
- * Normaliza os participantes da liga em um array de objetos:
- * { time_id, nome }
- * A API varia entre:
- * - data.times: [{ time_id, nome, ... }]
- * - data.times: [{ time: { time_id, nome, ... } }]
- * - data.times_participantes: idem
- */
-function normalizaParticipantesLiga(liga) {
-  const candidatos =
-    liga?.times ??
-    liga?.times_participantes ??
-    liga?.times_dono ?? // outros campos que já apareceram
-    [];
+// pega participantes da liga independente do shape
+function extrairParticipantesLiga(ligaJson) {
+  // alguns formatos comuns:
+  // - ligaJson.times
+  // - ligaJson.times_participantes
+  // - ligaJson.participantes
+  // - ligaJson.liga?.times
+  // - etc.
+  const candidates = [
+    ligaJson?.times,
+    ligaJson?.times_participantes,
+    ligaJson?.participantes,
+    ligaJson?.liga?.times,
+  ].filter(Boolean);
 
-  const norm = [];
-  for (const t of candidatos) {
-    if (!t) continue;
-    const time_id = t.time_id ?? t?.time?.time_id ?? t?.time?.time_id;
-    const nome =
-      t.nome ??
-      t?.time?.nome ??
-      t?.nome_time ??
-      t?.time?.nome_cartola ??
-      'Time';
-    if (time_id) norm.push({ time_id, nome });
+  for (const c of candidates) {
+    if (Array.isArray(c) && c.length) return c;
   }
-  return norm;
+  return []; // fallback
 }
 
-// ===== Rotas =====
-app.get('/health', (_req, res) => res.json({ ok: true }));
+// normaliza cada item de participante → { time_id, nome }
+function normalizarParticipante(p) {
+  // tentar diversos jeitos
+  const timeId = p?.time_id || p?.time?.time_id || p?.time?.id || p?.id_time;
+  const nome =
+    p?.nome_time ||
+    p?.time?.nome ||
+    p?.nome ||
+    p?.time?.nome_cartola ||
+    'Time';
+  return { timeId, nome };
+}
 
-app.get('/status', async (_req, res) => {
+// ================== ROTAS ==================
+
+// Saúde
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+// Status do mercado (para você checar se está fechado/aberto)
+app.get('/status', async (req, res) => {
   try {
     const st = await getStatus();
     res.json(st);
   } catch (e) {
-    console.error('STATUS FAIL', e?.response?.status, e?.response?.data || e.message);
-    res.status(500).json({ error: 'STATUS FAIL' });
+    res.status(e?.response?.status || 500).json({
+      error: 'STATUS FAIL',
+      status: e?.response?.status || null,
+      data: e?.response?.data || e.message || null,
+    });
   }
 });
 
-// Debug liga (para inspecionar formato real da sua liga)
+// Debug da liga — mostra erro detalhado se der ruim
 app.get('/debug/league/:league', async (req, res) => {
   try {
     const liga = await getLeague(req.params.league);
     res.json(liga);
   } catch (e) {
-    console.error('LEAGUE DEBUG FAIL', e?.response?.status, e?.response?.data || e.message);
-    res.status(500).json({ error: 'LEAGUE DEBUG FAIL' });
+    res.status(e?.response?.status || 500).json({
+      error: 'LEAGUE DEBUG FAIL',
+      status: e?.response?.status || null,
+      data: e?.response?.data || e.message || null,
+      tried: {
+        plural: `/ligas/${encodeURIComponent(req.params.league)}`,
+        singular: `/liga/${encodeURIComponent(req.params.league)}`
+      }
+    });
   }
 });
 
-// Debug time (para ver se escalação chega sem login)
-app.get('/debug/team/:id', async (req, res) => {
+// Debug de lineup/time individual
+app.get('/debug/time/:id', async (req, res) => {
   try {
-    const url = `${CARTOLA_API}/time/id/${req.params.id}`;
-    const { data } = await axios.get(url, { headers });
-    res.json(data);
+    const atletas = await getTimeLineup(req.params.id);
+    res.json({ time_id: req.params.id, atletas });
   } catch (e) {
-    console.error('TEAM DEBUG FAIL', e?.response?.status, e?.response?.data || e.message);
-    res.status(500).json({ error: 'TEAM DEBUG FAIL' });
+    res.status(e?.response?.status || 500).json({
+      error: 'TIME DEBUG FAIL',
+      status: e?.response?.status || null,
+      data: e?.response?.data || e.message || null,
+    });
   }
 });
 
-// Live da liga (parciais)
-app.get('/live/:league', async (req, res) => {
-  const league = req.params.league;
+// Live parciais da liga
+app.get('/live/:leagueId', async (req, res) => {
   try {
-    const status = await getStatus();
-    // 2 = mercado fechado / bola rolando
-    if (Number(status?.status_mercado) !== 2) {
-      return res.status(503).json({ error: 'Mercado não está fechado/bola não rolando.' });
+    // 1) status — checa mercado
+    const st = await getStatus();
+    const fechado = Number(st?.status_mercado) === 2; // 2 == fechado
+
+    // 2) liga
+    const leagueId = req.params.leagueId;
+    const liga = await getLeague(leagueId);
+
+    // 3) se mercado está aberto, não há parciais — ainda assim devolvemos shape coerente
+    if (!fechado) {
+      return res.json({
+        liga: liga?.liga || { id: leagueId },
+        status_mercado: st?.status_mercado,
+        bola_rolando: !!st?.bola_rolando,
+        mensagem: 'Mercado aberto — sem parciais disponíveis.',
+        resultados: [],
+      });
     }
 
-    const liga = await getLeague(league);
-    const participantes = normalizaParticipantesLiga(liga);
-    if (!participantes.length) {
-      console.error('PARTICIPANTES VAZIO - estrutura inesperada:', Object.keys(liga || {}));
-      return res.status(404).json({ error: 'Liga sem participantes visíveis (pode exigir login).' });
-    }
+    // 4) parciais (pontuados)
+    const pontuados = await getPontuados(); // key: atleta_id (string)
 
-    const pontuados = await getPontuados(); // só responde quando bola rolando
+    // 5) participantes
+    const participantes = extrairParticipantesLiga(liga);
     const resultados = [];
 
     for (const p of participantes) {
-      const atletas = await getTimeLineup(p.time_id);
+      const { timeId, nome } = normalizarParticipante(p);
+      if (!timeId) continue;
+
+      const atletas = await getTimeLineup(timeId);
       let total = 0;
       for (const id of atletas) {
-        const up = pontuados[String(id)];
-        if (up && typeof up.pontuacao === 'number') total += up.pontuacao;
+        const parcial = pontuados[String(id)];
+        if (parcial && typeof parcial.pontuacao === 'number') {
+          total += parcial.pontuacao;
+        }
       }
+
       resultados.push({
-        time_id: p.time_id,
-        nome: p.nome,
+        time_id: timeId,
+        nome,
         parcial: Number(total.toFixed(2)),
       });
     }
@@ -159,16 +216,20 @@ app.get('/live/:league', async (req, res) => {
     resultados.sort((a, b) => b.parcial - a.parcial);
 
     res.json({
-      liga: liga?.liga ?? { id_or_slug: league },
+      liga: liga?.liga || { id: leagueId },
+      status_mercado: st?.status_mercado,
+      bola_rolando: !!st?.bola_rolando,
       atualizacao: new Date().toISOString(),
       resultados,
     });
   } catch (e) {
-    console.error('LIVE FAIL', e?.response?.status, e?.response?.data || e.message);
+    console.error('LIVE ERROR:', e?.response?.status, e?.response?.data || e.message);
     res.status(500).json({ error: 'Falha ao obter parciais da liga.' });
   }
 });
 
-// ===== Start =====
+// ================== START ==================
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Proxy Cartola rodando na porta ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Proxy Cartola rodando na porta ${PORT}`);
+});
